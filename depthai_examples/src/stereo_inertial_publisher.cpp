@@ -5,6 +5,7 @@
 
 #include "camera_info_manager/camera_info_manager.hpp"
 #include "depthai_ros_msgs/msg/spatial_detection_array.hpp"
+#include "depthai_ros_msgs/msg/tracked_features.hpp"
 #include "rclcpp/node.hpp"
 #include "sensor_msgs/msg/image.hpp"
 #include "sensor_msgs/msg/imu.hpp"
@@ -21,12 +22,14 @@
 #include "depthai/pipeline/node/StereoDepth.hpp"
 #include "depthai/pipeline/node/XLinkIn.hpp"
 #include "depthai/pipeline/node/XLinkOut.hpp"
+#include "depthai/pipeline/node/FeatureTracker.hpp"
 #include "depthai_bridge/BridgePublisher.hpp"
 #include "depthai_bridge/DisparityConverter.hpp"
 #include "depthai_bridge/ImageConverter.hpp"
 #include "depthai_bridge/ImuConverter.hpp"
 #include "depthai_bridge/SpatialDetectionConverter.hpp"
 #include "depthai_bridge/depthaiUtility.hpp"
+#include "depthai_bridge/TrackedFeaturesConverter.hpp"
 
 std::vector<std::string> usbStrings = {"UNKNOWN", "LOW", "FULL", "HIGH", "SUPER", "SUPER_PLUS"};
 
@@ -48,7 +51,8 @@ std::tuple<dai::Pipeline, int, int> createPipeline(bool enableDepth,
                                                    int previewWidth,
                                                    int previewHeight,
                                                    bool syncNN,
-                                                   std::string nnPath) {
+                                                   std::string nnPath,
+                                                   bool leftFeatureTracker) {
     dai::Pipeline pipeline;
 
     auto controlIn = pipeline.create<dai::node::XLinkIn>();
@@ -116,6 +120,18 @@ std::tuple<dai::Pipeline, int, int> createPipeline(bool enableDepth,
     imu->enableIMUSensor(dai::IMUSensor::GYROSCOPE_RAW, 400);
     imu->setBatchReportThreshold(5);
     imu->setMaxBatchReports(20);  // Get one message only for now.
+
+    if (leftFeatureTracker) {
+        // Left feature tracker
+        auto featureTrackerLeft = pipeline.create<dai::node::FeatureTracker>();
+        auto xoutTrackedFeaturesLeft = pipeline.create<dai::node::XLinkOut>();
+        xoutTrackedFeaturesLeft->setStreamName("trackedFeaturesLeft");
+        monoLeft->out.link(featureTrackerLeft->inputImage);
+        featureTrackerLeft->outputFeatures.link(xoutTrackedFeaturesLeft->input);
+        auto numShaves = 2;
+        auto numMemorySlices = 2;
+        featureTrackerLeft->setHardwareResources(numShaves, numMemorySlices);
+    }
 
     if(depth_aligned) {
         // RGB image
@@ -294,6 +310,7 @@ int main(int argc, char** argv) {
     bool lrcheck, extended, subpixel, enableDepth, rectify, depth_aligned, manualExposure;
     bool enableSpatialDetection, enableDotProjector, enableFloodLight;
     bool usb2Mode, poeMode, syncNN;
+    bool leftFeatureTracker;
     double angularVelCovariance, linearAccelCovariance;
     double dotProjectormA, floodLightmA;
     bool enableRosBaseTimeUpdate;
@@ -341,6 +358,8 @@ int main(int argc, char** argv) {
     node->declare_parameter("floodLightmA", 200.0);
     node->declare_parameter("enableRosBaseTimeUpdate", false);
 
+    node->declare_parameter("leftFeatureTracker", false);
+
     // updating parameters if defined in launch file.
 
     node->get_parameter("mxId", mxId);
@@ -384,6 +403,8 @@ int main(int argc, char** argv) {
     node->get_parameter("floodLightmA", floodLightmA);
     node->get_parameter("enableRosBaseTimeUpdate", enableRosBaseTimeUpdate);
 
+    node->get_parameter("leftFeatureTracker", leftFeatureTracker);
+
     if(resourceBaseFolder.empty()) {
         throw std::runtime_error("Send the path to the resouce folder containing NNBlob in \'resourceBaseFolder\' ");
     }
@@ -424,7 +445,8 @@ int main(int argc, char** argv) {
                                                        previewWidth,
                                                        previewHeight,
                                                        syncNN,
-                                                       nnPath);
+                                                       nnPath,
+                                                       leftFeatureTracker);
 
     std::shared_ptr<dai::Device> device;
     std::vector<dai::DeviceInfo> availableDevices = dai::Device::getAllAvailableDevices();
@@ -518,6 +540,27 @@ int main(int argc, char** argv) {
         "imu");
 
     imuPublish.addPublisherCallback();
+
+    std::shared_ptr<dai::DataOutputQueue> outputFeaturesLeftQueue;
+    std::unique_ptr<dai::rosBridge::TrackedFeaturesConverter> leftConverter;
+    std::unique_ptr<dai::rosBridge::BridgePublisher<depthai_ros_msgs::msg::TrackedFeatures, dai::TrackedFeatures>> featuresPubL;
+    if (leftFeatureTracker) {
+        // Feature converter & publisher
+        outputFeaturesLeftQueue = device->getOutputQueue("trackedFeaturesLeft", 8, false);
+        leftConverter = std::make_unique<dai::rosBridge::TrackedFeaturesConverter>(tfPrefix + "_left_camera_optical_frame", false);
+        if(enableRosBaseTimeUpdate) {
+            leftConverter->setUpdateRosBaseTimeOnToRosMsg();
+        }
+        featuresPubL = std::make_unique<dai::rosBridge::BridgePublisher<depthai_ros_msgs::msg::TrackedFeatures, dai::TrackedFeatures>>(
+            outputFeaturesLeftQueue,
+            node,
+            std::string("features_left"),
+            std::bind(&dai::rosBridge::TrackedFeaturesConverter::toRosMsg, &*leftConverter, std::placeholders::_1, std::placeholders::_2),
+            30,
+            "",
+            "features_left");
+        featuresPubL->addPublisherCallback();
+    }
 
     // auto leftCameraInfo = converter.calibrationToCameraInfo(calibrationHandler, dai::CameraBoardSocket::LEFT, monoWidth, monoHeight);
     // auto rightCameraInfo = converter.calibrationToCameraInfo(calibrationHandler, dai::CameraBoardSocket::RIGHT, monoWidth, monoHeight);
